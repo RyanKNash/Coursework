@@ -1,0 +1,22 @@
+BFS was preserved.
+
+The solver still uses a FIFO queue, expands states in increasing move depth, stores parent links in each node, and reconstructs the final move sequence by walking those parent links. No A*, IDA*, DFS, greedy search, or heuristic priority ordering was added.
+
+Runtime and memory optimizations:
+- Boards are stored as unsigned char arrays instead of int arrays, reducing per-board memory use.
+- Each node stores the blank index, so expansion does not scan the whole board to find the blank.
+- Each node stores the previous move direction, and immediate reverse moves are skipped. This does not change BFS correctness because the parent state was already visited at the previous depth.
+- Queue operations are O(1) FIFO push/pop using a circular queue with queue_head, queue_tail, and queue_count. The queue now stores only the active frontier capacity instead of growing with every dequeued state.
+- Board comparison uses memcmp.
+- The visited table uses cached board hashes in each node and checks the hash before memcmp.
+- The hash table uses 1,048,583 buckets, reducing fixed memory while keeping a large visited table.
+- Board storage uses a block allocator, avoiding one malloc per stored BFS node.
+- Neighbor generation uses one reusable candidate board buffer. Duplicate neighbors are checked without allocating/freeing a board in the inner loop.
+- Accepted boards are copied directly into pooled storage and linked into the BFS node list.
+
+Data structure changes:
+- Node now stores an unsigned char *board, cached hash, parent index, moved tile, hash-chain link, blank index, and previous direction.
+- Solver now owns board storage blocks in addition to the node array, FIFO queue, and hash table.
+
+Why this still satisfies the assignment:
+The search order is still pure breadth-first traversal over puzzle states. Optimizations only reduce representation size, allocation overhead, invalid/redundant neighbor generation, and visited lookup cost. They do not change the FIFO ordering or the rule that the first time the goal is dequeued is a minimum-move solution.

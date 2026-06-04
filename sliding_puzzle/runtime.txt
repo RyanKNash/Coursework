@@ -1,0 +1,470 @@
+Runtime and Memory Analysis
+===========================
+
+Overview of current algorithm
+-----------------------------
+
+The current solver is a Breadth First Search (BFS) over puzzle board states.
+
+The solver:
+- Stores every discovered state in a Node array.
+- Uses a FIFO circular queue implemented with queue_head, queue_tail, and queue_count.
+- Expands states in the order they were discovered.
+- Stores each node's parent index and moved tile so the final path can be reconstructed.
+- Uses a hash table to avoid revisiting states.
+- Uses unsigned char boards, so each tile occupies one byte.
+- Stores the blank index in each node, avoiding a full board scan during expansion.
+- Stores the previous move direction and skips the immediate reverse move.
+
+This preserves BFS semantics. The first time the goal state is dequeued, the path is a minimum-move solution.
+
+
+Estimated time complexity
+-------------------------
+
+Let:
+- n = k * k, the number of board positions.
+- S = number of reachable states explored before the goal is found.
+- b = effective branching factor.
+- L = average hash-chain length for visited lookup.
+
+Worst-case BFS state count is exponential in solution depth. For a k^2 - 1 puzzle, the reachable state space is approximately:
+
+    (n!) / 2
+
+For 3x3, this is 181,440 reachable states.
+For 4x4, this is about 16! / 2, which is far too large for ordinary BFS in hard cases.
+
+Per expanded state, the code checks up to four moves, usually fewer after edge checks and immediate reverse pruning. For each generated candidate, it does:
+- memcpy of n bytes to candidate_board
+- two byte assignments for the swap
+- hash_board over n bytes
+- visited hash-chain traversal
+- possibly another memcpy of n bytes into stored board memory
+
+Expected time:
+
+    O(S * b * (n + L * compare_cost))
+
+With a good hash distribution and a large table, L is near constant on average, so expected time is roughly:
+
+    O(S * b * n)
+
+Worst-case hash behavior is:
+
+    O(S * b * (n + S * n))
+
+if many states collide into the same hash bucket, but the current hash table and cached hashes make this unlikely for normal inputs.
+
+
+Estimated memory complexity
+---------------------------
+
+The solver stores all discovered states, so memory is:
+
+    O(S * (node metadata + board bytes + queue entry)) + O(hash table)
+
+Current per-state memory is approximately:
+- Board: n bytes. For 3x3 this is 9 bytes. For 4x4 this is 16 bytes.
+- Node metadata: one board pointer, one 64-bit hash, and five ints. On a typical 64-bit platform this is likely around 40 bytes after padding.
+- Queue entry: 4 bytes per discovered node, because the queue array grows and never compacts.
+- Hash table link is stored inside Node as hash_next.
+
+Approximate per-state storage:
+
+    about 40 + n + 4 bytes
+
+For 4x4, this is roughly 60 bytes per discovered state, before allocator/block overhead and array over-allocation.
+
+Fixed hash table memory:
+
+    1,048,583 int entries * 4 bytes = about 4 MB
+
+The board block allocator stores boards in blocks of 4096 states, so it avoids per-board malloc overhead and has little wasted space except in the final partial block.
+
+
+Top runtime bottlenecks ranked by impact
+----------------------------------------
+
+1. Fundamental BFS state explosion
+
+Why expensive:
+BFS explores every state at depth 0, then every state at depth 1, and so on until the goal is reached. Sliding puzzle branching grows rapidly with depth.
+
+Asymptotic cost:
+O(b^d), where d is the solution depth. More precisely, it is O(S), where S is the number of states dequeued before the goal.
+
+Practical impact:
+This is the dominant cost. For 3x3 puzzles BFS is usually fine. For hard 4x4 puzzles, plain BFS can time out or exhaust memory even with efficient implementation because the number of shallow states is enormous.
+
+BFS-compatible optimizations:
+- Keep the current visited table to avoid revisiting states.
+- Keep immediate reverse pruning; the reversed state is the parent and is already visited.
+- Improve representation and hashing to reduce the constant factor.
+- If allowed by the assignment, use direction-specific move ordering only if it remains FIFO and does not prioritize by heuristic. Move order changes which minimum solution is found but not BFS depth correctness.
+- Do not use A*, IDA*, greedy search, DFS, or bidirectional search if the assignment forbids them.
+
+
+2. Board copy and hash work inside the BFS expansion loop
+
+Code location:
+solve_puzzle expansion loop around candidate generation:
+- memcpy(candidate_board, current_board, n)
+- hash_board(candidate_board, n)
+- sometimes memcpy(stored_board, candidate_board, n)
+
+Why expensive:
+This runs for every generated legal neighbor. Each generated neighbor scans/copies the whole board even though only two positions changed.
+
+Asymptotic cost:
+O(n) per generated neighbor.
+Overall expected cost is O(S * b * n).
+
+Practical impact:
+For 3x3 and 4x4, n is small, but this code is executed millions of times in larger BFS searches. The constant factor matters. The current code is much better than using int boards because n bytes are copied instead of n * sizeof(int), but accepted states still copy the board twice.
+
+BFS-compatible optimizations:
+- Keep the reusable candidate_board to avoid malloc/free per neighbor.
+- Consider computing a rolling hash from the parent hash and the two changed positions. This can reduce hash_board from O(n) to O(1), but it requires a hash function designed for position updates.
+- Consider generating directly into pooled board storage and rolling back the pool allocation if the state is already visited. That can remove the second memcpy for accepted states, but it must be implemented carefully so duplicate candidates do not leak pool space.
+- For 4x4 only, packing the board into a uint64_t would make copy/equality/hash cheaper. This remains BFS-compatible, but it is a larger representation change.
+
+
+3. Visited hash-chain traversal
+
+Code location:
+visited_contains_in_bucket()
+
+Why expensive:
+Every candidate state checks the hash table. If many states map to the same bucket, the code traverses a linked list of node indices. Each chain step accesses solver->nodes[node_index], which can be cache-unfriendly as the node array grows.
+
+Asymptotic cost:
+Expected O(1) per candidate with a good hash table.
+Worst-case O(S) per candidate if collisions are severe.
+
+Practical impact:
+The hash table size is currently 1,048,583 buckets, about 4 MB. This lowers fixed memory while still giving a large visited table. Cached hashes reduce expensive memcmp calls because boards are compared only when the stored hash matches.
+
+Remaining cost comes from:
+- Pointer/index chasing through hash chains.
+- Poor cache locality when chains touch nodes scattered through memory.
+- The modulo operation in hash_bucket.
+
+BFS-compatible optimizations:
+- Keep cached hashes.
+- Keep a large hash table if memory allows.
+- Because 1,048,583 is not a power of two, modulo is a true division on many platforms. A power-of-two table would allow bucket = hash & (hash_size - 1), but hash_size must then be a power of two and hash distribution should be checked.
+- Store hash_next and hash near each other, as currently done.
+- If memory allows, increasing the hash table further can reduce chains but increases initialization time and fixed memory.
+
+
+4. Memory growth from storing every discovered state
+
+Why expensive:
+BFS must keep enough state to avoid revisits and reconstruct the path. This implementation stores all discovered boards and all node metadata until the search ends.
+
+Asymptotic cost:
+O(S * n) for boards plus O(S) for nodes and queue.
+
+Practical impact:
+This is the second fundamental limit after runtime. Even at about 60 bytes per discovered 4x4 state, tens of millions of states would require hundreds of MB to multiple GB. Autograders often have memory limits that can be hit before CPU time.
+
+BFS-compatible optimizations:
+- Current unsigned char boards are already a major improvement.
+- Board packing into uint64_t for 4x4 would reduce board storage from 16 bytes plus pointer indirection to 8 bytes if integrated into Node directly.
+- If supporting only k <= 4, packed boards are likely the highest-value memory optimization.
+- Store parent, move, blank index, previous direction, and hash compactly if bounds allow. For example, previous_direction can fit in signed char and move can fit in unsigned char. This may reduce Node size after padding if fields are rearranged carefully.
+
+
+5. Cache-unfriendly board pointer layout
+
+Why expensive:
+Each Node stores a pointer to board bytes held in separate board blocks. Expanding a node touches:
+- Node metadata in solver->nodes
+- Board bytes in board block memory
+- Queue array
+- Hash table heads
+- Hash-chain nodes
+
+This spreads memory accesses across multiple arrays and blocks.
+
+Asymptotic cost:
+Still O(1) metadata access and O(n) board operations, but with higher cache miss cost.
+
+Practical impact:
+For small searches, this is minor. For large BFS runs, memory bandwidth and cache misses can dominate. The board pool helps because boards inside each block are contiguous, but Node and board data are still separate.
+
+BFS-compatible optimizations:
+- For 4x4, store a packed uint64_t board directly in Node to eliminate the board pointer and improve locality.
+- Alternatively, store fixed-size unsigned char board[16] directly in Node if k <= 4. This increases Node size but removes pointer chasing and board block management.
+- Keep the current pool if variable k support is required.
+
+
+6. Queue memory now tracks the active frontier
+
+Code location:
+enqueue(), dequeue(), queue_empty()
+
+Why expensive:
+The queue uses queue_head, queue_tail, and queue_count as a circular buffer, so operations are O(1) and dequeued slots are reused. Queue memory now grows with peak frontier size rather than total discovered states.
+
+Asymptotic cost:
+O(F) queue memory, where F is the maximum number of states waiting in the BFS frontier.
+
+Practical impact:
+This is an improvement over a linear append-only queue. Each queue entry is only an int, so queue memory is still smaller than node and board storage, but reusing slots avoids unnecessary growth in long searches.
+
+BFS-compatible optimizations:
+- The current circular queue is the intended BFS-compatible optimization.
+- Resizing preserves FIFO order by copying the active frontier in dequeue order.
+
+
+7. Goal check uses memcmp on every dequeued state
+
+Code location:
+boards_equal(current_board, goal, n)
+
+Why expensive:
+Every dequeued state compares up to n bytes against the goal.
+
+Asymptotic cost:
+O(n) per dequeued state, so O(S * n).
+
+Practical impact:
+n is small, and memcmp exits early on most non-goal states. This is usually moderate to minor compared with neighbor generation and visited checks.
+
+BFS-compatible optimizations:
+- Cache the goal hash and first compare current node hash to goal hash before memcmp.
+- For a packed board representation, goal check becomes integer equality.
+
+
+8. Realloc growth for nodes and queue
+
+Code location:
+ensure_node_capacity(), enqueue()
+
+Why expensive:
+When arrays grow, realloc may copy the existing array. This is occasional but can be costly for large searches.
+
+Asymptotic cost:
+Amortized O(1) append, O(S) total copying over all growths.
+
+Practical impact:
+Moderate for very large BFS runs. The doubling strategy is correct and usually acceptable. Initial capacity of 1024 is small but not a correctness issue.
+
+BFS-compatible optimizations:
+- Start with a larger initial node and queue capacity for known hard tests.
+- Keep doubling growth.
+- If memory limits are tight, avoid over-large initial capacities.
+
+
+9. Hash table initialization
+
+Code location:
+init_solver() loop setting 1,048,583 buckets to -1.
+
+Why expensive:
+This is O(hash_size) before BFS starts.
+
+Asymptotic cost:
+O(H), where H is hash table size.
+
+Practical impact:
+For hard cases this is negligible compared with BFS. For tiny puzzles it is noticeable but still usually acceptable. The table costs about 4 MB even for 3x3.
+
+BFS-compatible optimizations:
+- Choose hash size based on k. Smaller table for 3x3, larger for 4x4.
+- Keep the larger table if autograder cases emphasize harder 4x4 puzzles and memory allows.
+
+
+10. Solvability test nested loop
+
+Code location:
+is_solvable()
+
+Why expensive:
+Counts inversions with a nested loop.
+
+Asymptotic cost:
+O(n^2).
+
+Practical impact:
+Minor. n is 9 for 3x3 and 16 for 4x4, so this is tiny compared with BFS.
+
+BFS-compatible optimizations:
+- None needed for k <= 4.
+
+
+Major bottlenecks
+-----------------
+
+1. BFS state explosion.
+This is the fundamental limiter and can still time out on hard 4x4 cases even after implementation-level optimization.
+
+2. Board copy/hash/visited work per generated neighbor.
+This is the hottest code path inside BFS.
+
+3. Memory required to store all discovered states.
+This can hit autograder memory limits before the CPU limit.
+
+
+Moderate bottlenecks
+--------------------
+
+1. Hash-chain traversal and cache misses.
+The large hash table and cached hashes help, but collisions and random memory access still matter.
+
+2. Queue array memory grows with all discovered states.
+Operations are O(1), but memory can be higher than necessary.
+
+3. Realloc growth of nodes and queue.
+Amortized acceptable, but large copies can occur during big searches.
+
+4. Goal memcmp on each dequeued state.
+Usually small, but it is in the main BFS loop.
+
+
+Minor bottlenecks
+-----------------
+
+1. Hash table initialization for small puzzles.
+2. Solvability test O(n^2).
+3. Path reconstruction after the goal is found.
+4. Input parsing and output writing.
+
+
+Recommended optimizations ranked by expected benefit
+----------------------------------------------------
+
+1. Keep the current BFS optimizations already present.
+These include unsigned char boards, stored blank index, O(1) FIFO queue, cached hashes, large hash table, block board allocator, reusable candidate buffer, and memcmp.
+
+Expected benefit:
+Already high. These directly reduce the cost of each BFS state.
+
+
+2. Pack 4x4 boards into uint64_t if the assignment permits representation changes.
+
+Why:
+A 4x4 board has 16 tiles, each fitting in 4 bits. A full board fits in 64 bits.
+
+Expected benefit:
+High for 4x4. It can reduce memory, improve cache locality, make equality O(1), and make hashing cheaper.
+
+BFS compliance:
+Fully BFS-compatible if queue order, visited behavior, parent links, and output reconstruction are preserved.
+
+
+3. Keep the circular queue.
+
+Why:
+The current queue reuses dequeued slots and grows with peak frontier size.
+
+Expected benefit:
+Moderate memory savings compared with an append-only FIFO queue. Runtime impact is small.
+
+BFS compliance:
+Fully BFS-compatible because FIFO ordering is unchanged.
+
+
+4. Avoid the second board copy for accepted candidates.
+
+Why:
+Accepted candidates currently copy current_board to candidate_board, then copy candidate_board to stored_board.
+
+Expected benefit:
+Moderate. It reduces memory bandwidth in the hot loop.
+
+Possible BFS-compatible approach:
+Allocate a board from the pool, copy current_board into it, make the move, hash/check it, and if duplicate, roll back the pool allocation only when the allocation was the most recent board in the current block. This must be implemented carefully to avoid corrupting stored boards.
+
+
+5. Use an incrementally updatable hash.
+
+Why:
+Only two board positions change per move. Current hash_board scans all n bytes.
+
+Expected benefit:
+Moderate for large searches.
+
+BFS compliance:
+Fully BFS-compatible. This changes only visited lookup cost, not search order.
+
+Caution:
+The current FNV-style hash is order-sensitive but not easy to update after a swap. A Zobrist-style hash table indexed by position and tile would support O(1) updates.
+
+
+6. Tune hash table size by puzzle size.
+
+Why:
+The current 1,048,583 bucket table is a reduced fixed-size table. It lowers memory compared with the earlier larger table, but puzzle-size-specific sizing could reduce memory further for 3x3.
+
+Expected benefit:
+Moderate memory improvement on small puzzles, possible runtime improvement if cache effects improve.
+
+BFS compliance:
+Fully BFS-compatible.
+
+
+7. Compact Node fields.
+
+Why:
+Node metadata is probably around 40 bytes due to 64-bit alignment. Some fields need less than int range for k <= 4.
+
+Expected benefit:
+Moderate memory improvement if layout is carefully measured.
+
+Possible changes:
+- previous_direction as signed char.
+- move as unsigned char.
+- blank_index as unsigned char.
+- Keep parent and hash_next as int unless node_count can exceed int range.
+
+BFS compliance:
+Fully BFS-compatible.
+
+
+Likely reasons the autograder could still time out
+--------------------------------------------------
+
+1. Plain BFS is intrinsically too large for hard 4x4 cases.
+Even optimized BFS may not finish if the required solution depth is high. The state space of the 15-puzzle is enormous.
+
+2. Memory limit may be reached before time limit.
+BFS stores all discovered states. The current implementation is memory-conscious, but millions of states still consume substantial memory.
+
+3. Board copy and hash costs accumulate over millions of generated neighbors.
+Each legal candidate still requires O(n) copy and O(n) hashing.
+
+4. Hash table and node array access patterns are not fully cache-friendly.
+Large BFS runs become memory-bandwidth-bound.
+
+5. The fixed hash table costs about 4 MB upfront.
+This helps hard cases but may be wasteful under strict memory limits.
+
+
+Conclusion
+----------
+
+The current implementation remains a correct BFS solver. It uses a FIFO queue, expands states by increasing move depth, avoids revisiting states, preserves parent links, and reconstructs a shortest move sequence.
+
+The highest-value BFS-preserving improvements already present are:
+- unsigned char board storage
+- stored blank index
+- O(1) FIFO queue
+- immediate reverse pruning
+- hash table visited set
+- cached hashes
+- block allocation for boards
+- reusable candidate buffer
+
+The largest remaining issue is not an implementation bug but the BFS requirement itself. For hard 4x4 instances, BFS may still time out or run out of memory because it must explore a very large number of states before reaching deeper solutions.
+
+If more optimization is needed while preserving BFS, the best next steps are:
+1. Pack 4x4 boards into uint64_t.
+2. Keep the circular queue.
+3. Remove the second copy for accepted candidates.
+4. Use an incrementally updatable hash such as Zobrist hashing.
+5. Measure and compact Node layout.
+
+These changes preserve BFS correctness and assignment compliance because they alter only state representation and constant factors, not the FIFO exploration order or parent-link solution reconstruction.

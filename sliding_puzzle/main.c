@@ -2,14 +2,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define HASH_SIZE 1048583
+
+typedef struct BoardBlock {
+	unsigned char *boards;
+	int used;
+	int capacity;
+	struct BoardBlock *next;
+} BoardBlock;
+
 typedef struct Node {
-	int *board;
+	unsigned char *board;
+	unsigned long long hash;
 	int parent;
 	int move;
 	int hash_next;
 	int blank_index;
-	int depth;
-	int priority;
 	int previous_direction;
 } Node;
 
@@ -18,11 +26,14 @@ typedef struct Solver {
 	int node_count;
 	int node_capacity;
 	int *queue;
+	int queue_head;
 	int queue_tail;
+	int queue_count;
 	int queue_capacity;
 	int *hash_heads;
 	int hash_size;
 	int board_size;
+	BoardBlock *board_blocks;
 } Solver;
 
 static void *checked_malloc(size_t size) {
@@ -34,16 +45,11 @@ static void *checked_malloc(size_t size) {
 	return ptr;
 }
 
-static int boards_equal(const int *a, const int *b, int n) {
-	for (int i = 0; i < n; i++) {
-		if (a[i] != b[i]) {
-			return 0;
-		}
-	}
-	return 1;
+static int boards_equal(const unsigned char *a, const unsigned char *b, int n) {
+	return memcmp(a, b, (size_t)n * sizeof(unsigned char)) == 0;
 }
 
-static unsigned long long hash_board(const int *board, int n){
+static unsigned long long hash_board(const unsigned char *board, int n){
 	unsigned long long hash = 14695981039346656037ULL;
 	for (int i = 0; i < n; i++){
 		hash ^= (unsigned long long)(board[i] + 1);
@@ -52,33 +58,65 @@ static unsigned long long hash_board(const int *board, int n){
 	return hash;
 }
 
+static BoardBlock *new_board_block(int board_size)
+{
+    BoardBlock *block = checked_malloc(sizeof(BoardBlock));
+    block->capacity = 4096;
+    block->used = 0;
+    block->boards = checked_malloc((size_t)block->capacity * (size_t)board_size * sizeof(unsigned char));
+    block->next = NULL;
+    return block;
+}
+
 static void init_solver(Solver *solver, int board_size)
 {
+    solver->board_size = board_size;
+
     solver->node_capacity = 1024;
     solver->node_count = 0;
     solver->nodes = checked_malloc((size_t)solver->node_capacity * sizeof(Node));
 
     solver->queue_capacity = 1024;
+    solver->queue_head = 0;
     solver->queue_tail = 0;
+    solver->queue_count = 0;
     solver->queue = checked_malloc((size_t)solver->queue_capacity * sizeof(int));
 
-    solver->hash_size = 1000003;
+    solver->hash_size = HASH_SIZE;
     solver->hash_heads = checked_malloc((size_t)solver->hash_size * sizeof(int));
     for (int i = 0; i < solver->hash_size; i++) {
         solver->hash_heads[i] = -1;
     }
 
-    solver->board_size = board_size;
+    solver->board_blocks = NULL;
 }
 
 static void free_solver(Solver *solver)
 {
-    for (int i = 0; i < solver->node_count; i++) {
-        free(solver->nodes[i].board);
+    BoardBlock *block = solver->board_blocks;
+    while (block != NULL) {
+        BoardBlock *next = block->next;
+        free(block->boards);
+        free(block);
+        block = next;
     }
     free(solver->nodes);
     free(solver->queue);
     free(solver->hash_heads);
+}
+
+static unsigned char *allocate_board(Solver *solver)
+{
+    if (solver->board_blocks == NULL || solver->board_blocks->used >= solver->board_blocks->capacity) {
+        BoardBlock *block = new_board_block(solver->board_size);
+        block->next = solver->board_blocks;
+        solver->board_blocks = block;
+    }
+
+    BoardBlock *block = solver->board_blocks;
+    unsigned char *board = block->boards + (size_t)block->used * (size_t)solver->board_size;
+    block->used++;
+    return board;
 }
 
 static void ensure_node_capacity(Solver *solver)
@@ -96,110 +134,67 @@ static void ensure_node_capacity(Solver *solver)
 
 static void enqueue(Solver *solver, int node_index)
 {
-    if (solver->queue_tail >= solver->queue_capacity) {
-        solver->queue_capacity *= 2;
-        solver->queue = realloc(solver->queue, (size_t)solver->queue_capacity * sizeof(int));
-        if (solver->queue == NULL) {
-            fprintf(stderr, "Memory allocation failed.\n");
-            exit(EXIT_FAILURE);
+    if (solver->queue_count >= solver->queue_capacity) {
+        int new_capacity = solver->queue_capacity * 2;
+        int *new_queue = checked_malloc((size_t)new_capacity * sizeof(int));
+        for (int i = 0; i < solver->queue_count; i++) {
+            new_queue[i] = solver->queue[(solver->queue_head + i) % solver->queue_capacity];
         }
+        free(solver->queue);
+        solver->queue = new_queue;
+        solver->queue_capacity = new_capacity;
+        solver->queue_head = 0;
+        solver->queue_tail = solver->queue_count;
     }
-    int heap_index = solver->queue_tail++;
-    while (heap_index > 0) {
-        int parent_index = (heap_index - 1) / 2;
-        int parent_node = solver->queue[parent_index];
-        if (solver->nodes[parent_node].priority <= solver->nodes[node_index].priority) {
-            break;
-        }
-        solver->queue[heap_index] = parent_node;
-        heap_index = parent_index;
-    }
-    solver->queue[heap_index] = node_index;
+    solver->queue[solver->queue_tail] = node_index;
+    solver->queue_tail = (solver->queue_tail + 1) % solver->queue_capacity;
+    solver->queue_count++;
 }
 
 static int dequeue(Solver *solver)
 {
-    int result = solver->queue[0];
-    int last = solver->queue[--solver->queue_tail];
-    int heap_index = 0;
-
-    while (1) {
-        int left = heap_index * 2 + 1;
-        int right = left + 1;
-        int child = left;
-
-        if (left >= solver->queue_tail) {
-            break;
-        }
-
-        if (right < solver->queue_tail &&
-            solver->nodes[solver->queue[right]].priority < solver->nodes[solver->queue[left]].priority) {
-            child = right;
-        }
-        if (solver->nodes[last].priority <= solver->nodes[solver->queue[child]].priority) {
-            break;
-        }
-        solver->queue[heap_index] = solver->queue[child];
-        heap_index = child;
-    }
-
-    solver->queue[heap_index] = last;
-    return result;
+    int node_index = solver->queue[solver->queue_head];
+    solver->queue_head = (solver->queue_head + 1) % solver->queue_capacity;
+    solver->queue_count--;
+    return node_index;
 }
 
 static int queue_empty(const Solver *solver)
 {
-    return solver->queue_tail == 0;
+    return solver->queue_count == 0;
 }
 
-static int visited_contains(const Solver *solver, const int *board)
+static int hash_bucket(const Solver *solver, unsigned long long hash)
 {
-    int bucket = (int)(hash_board(board, solver->board_size) % (unsigned long long)solver->hash_size);
+    return (int)(hash % (unsigned long long)solver->hash_size);
+}
+
+static int visited_contains_in_bucket(const Solver *solver, const unsigned char *board,
+                                      unsigned long long hash, int bucket)
+{
     for (int node_index = solver->hash_heads[bucket]; node_index != -1; node_index = solver->nodes[node_index].hash_next) {
-        if (boards_equal(solver->nodes[node_index].board, board, solver->board_size)) {
+        if (solver->nodes[node_index].hash == hash &&
+            boards_equal(solver->nodes[node_index].board, board, solver->board_size)) {
             return 1;
         }
     }
     return 0;
 }
 
-static int manhattan_distance(const int *board, int k)
-{
-    int distance = 0;
-    int n = k * k;
-
-    for (int i = 0; i < n; i++) {
-        int tile = board[i];
-        if (tile == 0) {
-            continue;
-        }
-
-        int current_row = i / k;
-        int current_col = i % k;
-        int goal_row = (tile - 1) / k;
-        int goal_col = (tile - 1) % k;
-        int row_delta = current_row - goal_row;
-        int col_delta = current_col - goal_col;
-        distance += (row_delta < 0 ? -row_delta : row_delta) + (col_delta < 0 ? -col_delta : col_delta);
-    }
-
-    return distance;
-}
-
-static int add_node_take_board(Solver *solver, int *board, int parent, int move, int blank_index, int k, int direction)
+static int add_node_take_board(Solver *solver, unsigned char *board, int parent, int move,
+                               int blank_index, int previous_direction,
+                               unsigned long long hash, int bucket)
 {
     ensure_node_capacity(solver);
 
     int node_index = solver->node_count++;
     solver->nodes[node_index].board = board;
+    solver->nodes[node_index].hash = hash;
     solver->nodes[node_index].parent = parent;
     solver->nodes[node_index].move = move;
     solver->nodes[node_index].blank_index = blank_index;
-    solver->nodes[node_index].depth = parent == -1 ? 0 : solver->nodes[parent].depth + 1;
-    solver->nodes[node_index].priority = solver->nodes[node_index].depth + manhattan_distance(board, k);
-    solver->nodes[node_index].previous_direction = direction;
+    solver->nodes[node_index].previous_direction = previous_direction;
 
-    int bucket = (int)(hash_board(board, solver->board_size) % (unsigned long long)solver->hash_size);
     solver->nodes[node_index].hash_next = solver->hash_heads[bucket];
     solver->hash_heads[bucket] = node_index;
 
@@ -207,14 +202,17 @@ static int add_node_take_board(Solver *solver, int *board, int parent, int move,
     return node_index;
 }
 
-static int add_node(Solver *solver, const int *board, int parent, int move, int blank_index, int k, int direction)
+static int add_node(Solver *solver, const unsigned char *board, int parent, int move,
+                    int blank_index, int previous_direction)
 {
-    int *board_copy = checked_malloc((size_t)solver->board_size * sizeof(int));
-    memcpy(board_copy, board, (size_t)solver->board_size * sizeof(int));
-    return add_node_take_board(solver, board_copy, parent, move, blank_index, k, direction);
+    unsigned char *board_copy = allocate_board(solver);
+    memcpy(board_copy, board, (size_t)solver->board_size * sizeof(unsigned char));
+    unsigned long long hash = hash_board(board_copy, solver->board_size);
+    return add_node_take_board(solver, board_copy, parent, move, blank_index, previous_direction,
+                               hash, hash_bucket(solver, hash));
 }
 
-static int is_solvable(const int *board, int k)
+static int is_solvable(const unsigned char *board, int k)
 {
     int n = k * k;
     int inversions = 0;
@@ -225,6 +223,7 @@ static int is_solvable(const int *board, int k)
             blank_row_from_top = i / k;
             continue;
         }
+
         for (int j = i + 1; j < n; j++) {
             if (board[j] != 0 && board[i] > board[j]) {
                 inversions++;
@@ -237,13 +236,11 @@ static int is_solvable(const int *board, int k)
     }
 
     int blank_row_from_bottom = k - blank_row_from_top;
-    if (blank_row_from_bottom % 2 == 0) {
-        return inversions % 2 == 1;
-    }
-    return inversions % 2 == 0;
+
+    return (inversions + blank_row_from_bottom) % 2 == 1;
 }
 
-static int find_blank(const int *board, int n)
+static int find_blank(const unsigned char *board, int n)
 {
     for (int i = 0; i < n; i++) {
         if (board[i] == 0) {
@@ -253,18 +250,19 @@ static int find_blank(const int *board, int n)
     return -1;
 }
 
-static int solve_puzzle(const int *initial_board, int k, int **moves_out)
+static int solve_puzzle(const unsigned char *initial_board, int k, int **moves_out)
 {
     int n = k * k;
-    int *goal = checked_malloc((size_t)n * sizeof(int));
+    unsigned char *goal = checked_malloc((size_t)n * sizeof(unsigned char));
     for (int i = 0; i < n - 1; i++) {
-        goal[i] = i + 1;
+        goal[i] = (unsigned char)(i + 1);
     }
     goal[n - 1] = 0;
 
     Solver solver;
     init_solver(&solver, n);
-    add_node(&solver, initial_board, -1, -1, find_blank(initial_board, n), k, -1);
+    add_node(&solver, initial_board, -1, -1, find_blank(initial_board, n), -1);
+    unsigned char *candidate_board = checked_malloc((size_t)n * sizeof(unsigned char));
 
     int goal_index = -1;
     const int row_change[4] = {-1, 1, 0, 0};
@@ -273,7 +271,7 @@ static int solve_puzzle(const int *initial_board, int k, int **moves_out)
 
     while (!queue_empty(&solver)) {
         int current_index = dequeue(&solver);
-        int *current_board = solver.nodes[current_index].board;
+        unsigned char *current_board = solver.nodes[current_index].board;
 
         if (boards_equal(current_board, goal, n)) {
             goal_index = current_index;
@@ -298,19 +296,22 @@ static int solve_puzzle(const int *initial_board, int k, int **moves_out)
             }
 
             int tile_index = new_row * k + new_col;
-            int *new_board = checked_malloc((size_t)n * sizeof(int));
-            memcpy(new_board, current_board, (size_t)n * sizeof(int));
-            new_board[blank_index] = new_board[tile_index];
-            new_board[tile_index] = 0;
+            memcpy(candidate_board, current_board, (size_t)n * sizeof(unsigned char));
+            candidate_board[blank_index] = candidate_board[tile_index];
+            candidate_board[tile_index] = 0;
 
-            if (!visited_contains(&solver, new_board)) {
-                add_node_take_board(&solver, new_board, current_index, current_board[tile_index], tile_index, k, d);
-            } else {
-                free(new_board);
+            unsigned long long hash = hash_board(candidate_board, n);
+            int bucket = hash_bucket(&solver, hash);
+            if (!visited_contains_in_bucket(&solver, candidate_board, hash, bucket)) {
+                unsigned char *stored_board = allocate_board(&solver);
+                memcpy(stored_board, candidate_board, (size_t)n * sizeof(unsigned char));
+                add_node_take_board(&solver, stored_board, current_index, current_board[tile_index],
+                                    tile_index, d, hash, bucket);
             }
         }
     }
 
+    free(candidate_board);
     free(goal);
 
     if (goal_index == -1) {
@@ -362,16 +363,30 @@ int main(int argc, char **argv)
     fscanf(fp_in, "%d\n", &k);
     fgets(line, sizeof(line), fp_in);
 
+    if (k < 2) {
+        fclose(fp_in);
+        fprintf(fp_out, "#moves\n");
+        fprintf(fp_out, "no solution\n");
+        fclose(fp_out);
+        return 0;
+    }
+
     int n = k * k;
-    int *initial_board = checked_malloc((size_t)n * sizeof(int));
+    unsigned char *initial_board = checked_malloc((size_t)n * sizeof(unsigned char));
+    int invalid_input = 0;
     for (int i = 0; i < n; i++) {
-        fscanf(fp_in, "%d", &initial_board[i]);
+        int tile;
+        fscanf(fp_in, "%d", &tile);
+        if (tile < 0 || tile >= n) {
+            invalid_input = 1;
+        }
+        initial_board[i] = (unsigned char)tile;
     }
     fclose(fp_in);
 
     fprintf(fp_out, "#moves\n");
 
-    if (!is_solvable(initial_board, k)) {
+    if (invalid_input || !is_solvable(initial_board, k)) {
         fprintf(fp_out, "no solution\n");
         free(initial_board);
         fclose(fp_out);

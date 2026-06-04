@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define HASH_SIZE 1048583
+#define HASH_MULTIPLIER 1013
 
 typedef struct BoardBlock {
 	unsigned char *boards;
@@ -68,7 +68,12 @@ static BoardBlock *new_board_block(int board_size)
     return block;
 }
 
-static void init_solver(Solver *solver, int board_size)
+static int calculate_hash_size(int k)
+{
+    return HASH_MULTIPLIER * (k * (k - 1) - 1);
+}
+
+static void init_solver(Solver *solver, int board_size, int k)
 {
     solver->board_size = board_size;
 
@@ -82,7 +87,7 @@ static void init_solver(Solver *solver, int board_size)
     solver->queue_count = 0;
     solver->queue = checked_malloc((size_t)solver->queue_capacity * sizeof(int));
 
-    solver->hash_size = HASH_SIZE;
+    solver->hash_size = calculate_hash_size(k);
     solver->hash_heads = checked_malloc((size_t)solver->hash_size * sizeof(int));
     for (int i = 0; i < solver->hash_size; i++) {
         solver->hash_heads[i] = -1;
@@ -260,7 +265,7 @@ static int solve_puzzle(const unsigned char *initial_board, int k, int **moves_o
     goal[n - 1] = 0;
 
     Solver solver;
-    init_solver(&solver, n);
+    init_solver(&solver, n, k);
     add_node(&solver, initial_board, -1, -1, find_blank(initial_board, n), -1);
     unsigned char *candidate_board = checked_malloc((size_t)n * sizeof(unsigned char));
 

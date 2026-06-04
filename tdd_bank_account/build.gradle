@@ -1,0 +1,64 @@
+plugins {
+    id 'java'
+    id 'idea'
+    id 'jacoco'
+    id 'info.solidsoft.pitest' version '1.5.2'
+}
+
+group 'org.example'
+version '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.jetbrains:annotations:20.1.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.4.2'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
+
+jacocoTestReport {
+    reports {
+        xml.required = true
+        xml.destination = project.file("$buildDir/reports/jacoco/jacocoTestReport.xml")
+    }
+}
+
+pitest {
+    targetClasses = ['banking.*']
+    targetTests = ['banking.*']
+    testSourceSets = [sourceSets.test]
+    mainSourceSets = [sourceSets.main]
+    pitestVersion = '1.5.2'
+    junit5PluginVersion = "0.12"
+    outputFormats = ['XML', 'HTML']
+}
+
+tasks.register('pitestTar', Tar) {
+    dependsOn tasks.named('pitest')
+    archiveFileName.set('pitest.tar.gz')
+    destinationDirectory.set(layout.buildDirectory.dir("reports"))
+    compression = Compression.GZIP
+    from(layout.buildDirectory.dir("reports/pitest"))
+}
+
+tasks.register('copyJacocoXml', Copy) {
+    from("$buildDir/reports/jacoco/jacocoTestReport.xml")
+    into(layout.projectDirectory.dir("builds/jacoco"))
+    rename { "jacoco.xml" }
+}
+
+tasks.named('pitest') {
+    finalizedBy(tasks.named('pitestTar'))
+}
+
+tasks.named('jacocoTestReport') {
+    finalizedBy(tasks.named('copyJacocoXml'))
+}

@@ -1,0 +1,93 @@
+read input file
+read k
+read initial_board[k*k]
+
+if puzzle_is_not_solvable(initial_board, k)
+{
+    print "#moves"
+    print "no solution"
+    exit
+}
+
+create goal_board:
+    1 2 3 ... k*k-1 0
+
+create empty queue
+create empty visited_set
+
+create start_node:
+    board = initial_board
+    parent = NULL
+    move = -1
+
+enqueue start_node
+add initial_board to visited_set
+
+while queue is not empty
+{
+    current = dequeue()
+
+    if current.board equals goal_board
+    {
+        reconstruct path:
+            moves = empty list
+
+            while current.parent != NULL
+            {
+                add current.move to moves
+                current = current.parent
+            }
+
+            reverse moves
+
+        print "#moves"
+        print all moves in order
+        exit
+    }
+
+    blank_index = find index of 0 in current.board
+    blank_row = blank_index / k
+    blank_col = blank_index % k
+
+    for each direction in {up, down, left, right}
+    {
+        new_row = blank_row + direction.row_change
+        new_col = blank_col + direction.col_change
+
+        if new_row and new_col are inside board
+        {
+            tile_index = new_row * k + new_col
+            moved_tile = current.board[tile_index]
+
+            new_board = copy of current.board
+            swap new_board[blank_index] and new_board[tile_index]
+
+            if new_board is not in visited_set
+            {
+                create child_node:
+                    board = new_board
+                    parent = current
+                    move = moved_tile
+
+                enqueue child_node
+                add new_board to visited_set
+            }
+        }
+    }
+}
+-------------------------------------------------------------------
+print "#moves"
+print "no solution"
+
+count inversions ignoring 0
+
+if k is odd:
+    solvable if inversions is even
+
+if k is even:
+    blank_row_from_bottom = k - blank_row_from_top
+
+    solvable if:
+        blank_row_from_bottom is even AND inversions is odd
+        OR
+        blank_row_from_bottom is odd AND inversions is even

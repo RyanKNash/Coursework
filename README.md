@@ -59,4 +59,4 @@ Each project folder has its own README with project-specific commands. In genera
 
 ## Recruiter Notes
 
-This repository is best read as a progression of coursework artifacts rather than a single production application. The strongest engineering examples are `tdd_bank_account`, `sliding_puzzle`, and `spelling_checker`, which show testing discipline, algorithmic reasoning, and low-level implementation work.
+This repository is best read as a progression of coursework artifacts rather than a single production application. The strongest engineering examples are `tdd_bank_account`, `sliding_puzzle`, 'huffman_coder' and `spelling_checker`, which show testing discipline, algorithmic reasoning, and low-level implementation work.
